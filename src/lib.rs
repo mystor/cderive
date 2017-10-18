@@ -1,52 +1,25 @@
-#[macro_use] extern crate log;
-#[macro_use] extern crate lazy_static;
-extern crate cexpr;
-extern crate regex;
-extern crate clang_sys;
-extern crate quote;
+extern crate clang_sys; // NOTE: This should match the version used by clang ideally
+pub extern crate clang;
 
-mod clang;
+use clang::*;
 
-pub use clang::Cursor;
-
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::error::Error;
 
 const DERIVE: &'static str = "DERIVE";
-
-fn ensure_libclang_is_loaded() {
-    if clang_sys::is_loaded() {
-        return;
-    }
-
-    // XXX (issue #350): Ensure that our dynamically loaded `libclang`
-    // doesn't get dropped prematurely, nor is loaded multiple times
-    // across different threads.
-
-    lazy_static! {
-        static ref LIBCLANG: Arc<clang_sys::SharedLibrary> = {
-            clang_sys::load().expect("Unable to find libclang");
-            clang_sys::get_library()
-                .expect("We just loaded libclang and it had better still be \
-                         here!")
-        };
-    }
-
-    clang_sys::set_library(Some(LIBCLANG.clone()));
-}
 
 /// Try to get the value at the cursor as an attribute(annotate). Returns the
 /// name of the value if the cursor points at an attribute(annotate), and
 /// Err(()) otherwise.
-fn get_annotation(cursor: Cursor) -> Result<String, ()> {
-    if cursor.kind() != clang_sys::CXCursor_AnnotateAttr {
+fn get_annotation(entity: Entity) -> Result<String, ()> {
+    if entity.get_kind() != EntityKind::AnnotateAttr {
         return Err(());
     }
-    Ok(cursor.display_name())
+    entity.get_display_name().ok_or(())
 }
 
-fn get_derive_name(cursor: Cursor) -> Result<String, ()> {
-    let annotation = get_annotation(cursor)?;
+fn get_derive_name(entity: Entity) -> Result<String, ()> {
+    let annotation = get_annotation(entity)?;
     let mut it = annotation.splitn(2, '=');
     let before = it.next().ok_or(())?;
     if before != DERIVE {
@@ -55,22 +28,72 @@ fn get_derive_name(cursor: Cursor) -> Result<String, ()> {
     Ok(it.next().ok_or(())?.to_owned())
 }
 
-fn discover_derives<F>(parent_cursor: Cursor, f: &mut F)
-    where F: FnMut(Cursor, String)
+fn discover_derives<F>(outer: Entity, f: &mut F)
+    where F: FnMut(Entity, String)
 {
-    parent_cursor.visit(|cursor| {
-        if let Ok(derive_name) = get_derive_name(cursor) {
+    outer.visit_children(|entity, parent_entity| {
+        if let Ok(derive_name) = get_derive_name(entity) {
             // XXX: Error Handling
-            let ty = parent_cursor.typedef_type().unwrap();
-            f(*ty.canonical_declaration(None).unwrap().cursor(), derive_name);
+            let ty = parent_entity.get_typedef_underlying_type().unwrap();
+            f(ty.get_declaration().unwrap().get_canonical_entity(), derive_name);
         }
-        discover_derives(cursor, &mut *f);
-        clang_sys::CXChildVisit_Continue
+        EntityVisitResult::Recurse
     });
 }
 
+// This is copied mostly wholesale from rust-bindgen
+fn fixup_clang_args(args: &mut Vec<String>) {
+    // Filter out include paths and similar stuff, so we don't incorrectly
+    // promote them to `-isystem`.
+    let sysargs = {
+        let mut last_was_include_prefix = false;
+        args.iter().filter(|arg| {
+            if last_was_include_prefix {
+                last_was_include_prefix = false;
+                return false;
+            }
+
+            let arg = &**arg;
+
+            // https://clang.llvm.org/docs/ClangCommandLineReference.html
+            // -isystem and -isystem-after are harmless.
+            if arg == "-I" || arg == "--include-directory" {
+                last_was_include_prefix = true;
+                return false;
+            }
+
+            if arg.starts_with("-I") || arg.starts_with("--include-directory=") {
+                return false;
+            }
+
+            true
+        }).cloned().collect::<Vec<_>>()
+    };
+
+    if let Some(clang) = clang_sys::support::Clang::find(None, &sysargs) {
+        // If --target is specified, assume caller knows what they're doing
+        // and don't mess with include paths for them
+        let has_target_arg = args
+            .iter()
+            .rposition(|arg| arg.starts_with("--target"))
+            .is_some();
+        if !has_target_arg {
+            // TODO: distinguish C and C++ paths? C++'s should be enough, I
+            // guess.
+            if let Some(cpp_search_paths) = clang.cpp_search_paths {
+                for path in cpp_search_paths.into_iter() {
+                    if let Ok(path) = path.into_os_string().into_string() {
+                        args.push("-isystem".to_owned());
+                        args.push(path);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub trait Derive {
-    fn derive(&mut self, cursor: Cursor) -> Result<String, ()>;
+    fn derive(&mut self, entity: Entity) -> Result<String, ()>;
 }
 
 pub struct Deriver<'a> {
@@ -86,29 +109,23 @@ impl<'a> Deriver<'a> {
         self.derives.insert(name.into(), derive);
     }
 
-    pub fn run(&mut self, args: &[String]) -> Result<String, ()> {
-        ensure_libclang_is_loaded();
+    pub fn run(&mut self, args: &[String]) -> Result<String, Box<Error>> {
+        let clang = Clang::new()?;
+        let index = Index::new(&clang, false, true);
 
-        // XXX: Handle this better?
         let filename = &args[0];
-        let args = &args[1..];
+        let mut args = args[1..].to_owned();
+        fixup_clang_args(&mut args);
+        let file = index.parser(filename).arguments(&args).parse()?;
 
-        let index = clang::Index::new(false, true);
-        let file = clang::TranslationUnit::parse(
-            &index,
-            filename,
-            args,
-            /* unsaved files */ &[],
-            /* opts */ clang_sys::CXTranslationUnit_DetailedPreprocessingRecord,
-        ).ok_or(())?;
+        let entity = file.get_entity();
 
-        let cursor = file.cursor();
-
-        let mut result = String::new();
-        discover_derives(cursor, &mut |cursor, name| {
+        // XXX: Encode filename as C-style string?
+        let mut result = format!("#include {:?}\n\n", filename);
+        discover_derives(entity, &mut |entity, name| {
             if let Some(derive) = self.derives.get_mut(&name) {
-                let r = derive.derive(cursor)
-                    .expect(&format!("Derive {} failed on {:?}", name, cursor));
+                let r = derive.derive(entity)
+                    .expect(&format!("Derive {} failed on {:?}", name, entity));
                 result.push_str(&r);
             } else {
                 eprintln!("Use of unregistered derive {}", name);

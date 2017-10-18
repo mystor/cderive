@@ -4,11 +4,8 @@ version = "0.1.0"
 authors = ["Nika Layzell <nika@thelayzells.com>"]
 
 [dependencies]
-cexpr = "0.2"
-clang-sys = { version = "0.21.0", features = ["runtime", "clang_3_9"] }
-regex = "0.2"
-lazy_static = "0.2.1"
-log = "0.3"
+clang = { version = "0.17", features = ["runtime", "clang_3_9"] }
+clang-sys = { version = "0.20.0", features = ["runtime", "clang_3_9"] }
 # NOTE: Don't up the version of quote used, as 0.3 is the last string-based
 # version of quote. This crate will likely eventually begin using an alternate
 # implementation of quote!().

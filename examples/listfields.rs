@@ -1,19 +1,18 @@
-extern crate clang_sys;
 extern crate cderive;
 
-use cderive::*;
+use cderive::clang::*;
 use std::env;
 
 struct ListFields;
 
 impl cderive::Derive for ListFields {
-    fn derive(&mut self, cursor: Cursor) -> Result<String, ()> {
+    fn derive(&mut self, entity: Entity) -> Result<String, ()> {
         let mut fields = Vec::new();
-        cursor.visit(|cursor| {
-            if cursor.kind() == clang_sys::CXCursor_FieldDecl {
-                fields.push(format!("{:?}", cursor.spelling()));
+        entity.visit_children(|entity, _| {
+            if entity.get_kind() == EntityKind::FieldDecl {
+                fields.push(format!("{:?}", entity.get_display_name().unwrap()));
             }
-            clang_sys::CXChildVisit_Continue
+            EntityVisitResult::Continue
         });
 
         Ok(format!("
@@ -26,7 +25,7 @@ const char** {ty}::field_names() {{
   return FIELD_NAMES;
 }}
 ",
-            ty = cursor.display_name(),
+            ty = entity.get_display_name().unwrap(),
             count = fields.len(),
             names = fields.join(", ")
         ))
