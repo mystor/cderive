@@ -35,7 +35,7 @@ fn discover_derives<F>(outer: Entity, f: &mut F)
         if let Ok(derive_name) = get_derive_name(entity) {
             // XXX: Error Handling
             let ty = parent_entity.get_typedef_underlying_type().unwrap();
-            f(ty.get_declaration().unwrap().get_canonical_entity(), derive_name);
+            f(ty.get_declaration().unwrap().get_definition().unwrap(), derive_name);
         }
         EntityVisitResult::Recurse
     });
